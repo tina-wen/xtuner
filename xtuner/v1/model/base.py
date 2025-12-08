@@ -39,7 +39,7 @@ from xtuner.v1.utils.load_spec import LoadEnum, LoadSpec
 from xtuner.v1.utils.loader import HFCheckpointLoader
 
 from .utils import ModelForwardExtraLogInfo
-
+import os
 
 logger = get_logger()
 
@@ -229,6 +229,10 @@ class BaseModel(nn.Module):
         start: int | None,
         end: int | None,
         dim: int | None,
+        flag: str | None,
+        num_expert: int = 128,
+        hidden_size: int = 4096,
+        moe_intermediate_size: int = 1536,
     ):
         if len(safetensors) > 1:
             assert dim is not None, "Internal Error dim must not be None when len(safetensors) > 1"
@@ -236,12 +240,23 @@ class BaseModel(nn.Module):
         else:
             loaded_tensor = safetensors[0]
 
+        if int(os.getenv("GROUPMM_NZ_TRANSPOSE","0")) == 1 and flag == 'fused':
+            out_feature, in_feature = safetensors[0].shape  
+            out_feature = out_feature * 2 if out_feature == moe_intermediate_size else out_feature
+            loaded_tensor = loaded_tensor.view(-1, out_feature, in_feature).transpose(1,2).contiguous().view(-1, out_feature).contiguous()
+
         if start is not None and end is not None:
             assert self.fsdp_config is not None, (
                 "Internal Error. fsdp_config must not be None when start and end is not None"
             )
             start = min(start, loaded_tensor.shape[self.FSDP_SHARD_DIM])
             end = min(end, loaded_tensor.shape[self.FSDP_SHARD_DIM])
+
+            if int(os.getenv("GROUPMM_NZ_TRANSPOSE","0")) == 1 and torch.distributed.get_world_size() >= num_expert and loaded_tensor.shape[self.FSDP_SHARD_DIM] == hidden_size:
+                if torch.distributed.get_rank() % 4 >= 2:
+                    start += hidden_size // 2
+                    end += hidden_size // 2
+
             loaded_tensor_slice = loaded_tensor.index_select(
                 dim=self.FSDP_SHARD_DIM, index=torch.arange(start, end, dtype=torch.int64, device=loaded_tensor.device)
             )
@@ -956,12 +971,12 @@ class BaseModel(nn.Module):
             end = None
 
         self.safetensors_to_params(
-            [loaded_tensor], local_tensor, param_name=load_spec.name, start=start, end=end, dim=load_spec.dim
+            [loaded_tensor], local_tensor, param_name=load_spec.name, start=start, end=end, dim=load_spec.dim, flag='same',
         )
         return []
 
     def _load_fused_hf_param(
-        self, param: torch.Tensor, load_spec: LoadSpec, checkpoint_loader: HFCheckpointLoader
+        self, param: torch.Tensor, load_spec: LoadSpec, checkpoint_loader: HFCheckpointLoader, num_expert: int = 128
     ) -> list[str]:
         # For expert parallel
         # NOTE:
@@ -1004,6 +1019,10 @@ class BaseModel(nn.Module):
             hf_keys_start = int(fsdp_start / hf_key_size)
             hf_keys_end = math.ceil(fsdp_end / hf_key_size)
 
+            if int(os.getenv("GROUPMM_NZ_TRANSPOSE","0")) == 1 and len(hf_keys) == num_expert *2 and torch.distributed.get_world_size() >= num_expert: # gate & up的情况，down的情况需要排除
+                hf_keys_start = int(torch.distributed.get_rank() // 4) * 2
+                hf_keys_end = hf_keys_start + 2
+
             # Empty pad by fsdp
             if hf_keys_start == hf_keys_end:
                 return []
@@ -1038,7 +1057,7 @@ class BaseModel(nn.Module):
             return missing_keys
 
         self.safetensors_to_params(
-            _loaded_tensor, local_tensor, param_name=load_spec.name, start=start, end=end, dim=load_spec.dim
+            _loaded_tensor, local_tensor, param_name=load_spec.name, start=start, end=end, dim=load_spec.dim, flag='fused',
         )
         return missing_keys
 
@@ -1084,6 +1103,7 @@ class BaseModel(nn.Module):
             start=start,
             end=end,
             dim=load_spec.dim,
+            flag='shard',
         )
         return []
 

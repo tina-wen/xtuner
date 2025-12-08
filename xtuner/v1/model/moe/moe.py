@@ -47,7 +47,12 @@ from xtuner.v1.utils import (
 )
 from xtuner.v1.utils.activation_offload import async_save_on_cpu
 from xtuner.v1.utils.compile import maybe_compile
+import torch_npu
+import os
 
+if int(os.getenv("LINEAR_ONLY_SHARD", "0")) == 1:
+    from xtuner.v1.patch.fsdp_partial_shard import apply_fsdp_partial_shard_patch
+    apply_fsdp_partial_shard_patch()
 
 DEVICE = get_device()
 logger = get_logger()
@@ -167,7 +172,7 @@ class MoE(BaseModel):
         else:
             self.z_loss = None
 
-        self.offload_stream = torch.cuda.Stream()
+        self.offload_stream = torch_npu.npu.Stream() #torch.cuda.Stream()
 
     def _select_non_pad_router_logits(
         self,
@@ -688,6 +693,16 @@ class MoE(BaseModel):
         )
         num_recompute_layers = int(self.config.num_hidden_layers * self.fsdp_config.recompute_ratio)
 
+        def layer_to_fully_shard(layer):
+            return [
+                layer.self_attn.q_proj,
+                layer.self_attn.k_proj,
+                layer.self_attn.v_proj,
+                layer.self_attn.o_proj,
+                layer.experts.fused_w1w3,
+                layer.experts.fused_w2,
+            ]
+
         for layer_idx, layer in tqdm(self.layers.items(), desc="[FSDP Sharding]"):
             layer_idx = int(layer_idx)
             if layer_idx < num_recompute_layers - 1:
@@ -698,19 +713,26 @@ class MoE(BaseModel):
                 reshard_after_forward = False
             else:
                 reshard_after_forward = self.fsdp_config.reshard_after_forward
+            is_linear_only_shard = int(os.getenv("LINEAR_ONLY_SHARD", "0")) == 1
             fully_shard(
-                layer,
+                layer_to_fully_shard(layer) if is_linear_only_shard else layer,
                 mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
                 mp_policy=mp_policy,
                 reshard_after_forward=reshard_after_forward,
                 offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+                **({'hook_module': layer} if is_linear_only_shard else {}),
             )
 
         for layer_cur, layer_next in zip(
             list(self.layers.values())[:-1],
             list(self.layers.values())[1:],
         ):
-            layer_cur.set_modules_to_forward_prefetch([layer_next])  # type: ignore
+            if not is_linear_only_shard:
+                layer_cur.set_modules_to_forward_prefetch([layer_next])  # type: ignore
+            else:
+                layer_cur_fully_shard_modules = layer_to_fully_shard(layer_cur)
+                layer_next_fully_shard_modules = layer_to_fully_shard(layer_next)
+                layer_cur_fully_shard_modules[0].set_modules_to_forward_prefetch([layer_next_fully_shard_modules[0]])
 
         fully_shard(
             self.embed_tokens,
