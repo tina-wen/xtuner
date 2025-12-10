@@ -32,6 +32,9 @@ from xtuner.v1.profiler.prober import ProberList
 from xtuner.v1.utils import get_device, get_logger, get_torch_device_module, profile_time_and_memory
 from xtuner.v1.utils.grad_norm import cal_grad_norm
 
+from xtuner.v1.engine.xtuner_storage import XtunnerWriter
+from xtuner.v1.engine.xtuner_cache_planner import XtunerCacheSavePlanner
+
 
 logger = get_logger()
 DEVICE = get_device()
@@ -412,7 +415,8 @@ class TrainEngine:
             model_state = get_model_state_dict(self.model, options=_options)
             dcp.save(
                 model_state,
-                checkpoint_id=model_dir,
+                storage_writer=XtunnerWriter(model_dir, enable_write_result_caching=True, cache_key_prefix = "model"),
+                planner=XtunerCacheSavePlanner(enable_plan_caching=True, cache_key_prefix="model"),
             )
 
         with profile_time_and_memory(f"[DCP Checkpoint to {optimizer_dir}]"):
@@ -420,7 +424,8 @@ class TrainEngine:
                 shard_optimizer_state_dict = get_optimizer_state_dict(self.model, self.optimizer, options=_options)
                 dcp.save(
                     shard_optimizer_state_dict,
-                    checkpoint_id=optimizer_dir,
+                    storage_writer=XtunnerWriter(optimizer_dir, enable_write_result_caching=True, cache_key_prefix = "optimizer"),
+                    planner=XtunerCacheSavePlanner(enable_plan_caching=True, cache_key_prefix="optimizer"),
                 )
 
     def load_dcp(
