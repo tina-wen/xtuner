@@ -169,9 +169,10 @@ class VisionComposeTrainEngine(TrainEngine):
                 num_tokens = seq_ctx.cu_seq_lens_k[1:] - seq_ctx.cu_seq_lens_k[:-1]
                 efficient_forward_tokens += (num_tokens.long() ** 2).sum()
                 total_forward_tokens += (num_tokens.long().sum()) ** 2
-
-            # todo: support intra_layer_micro_batch
-            output = self.model(seq_ctx=seq_ctx_list[0], loss_ctx=loss_ctx_list[0])
+            if len(seq_ctx_list) == 1:
+                output = self.model(seq_ctx=seq_ctx_list[0],loss_ctx=loss_ctx_list[0])
+            else:
+                output = self.model(seq_ctx=seq_ctx_list,loss_ctx=loss_ctx_list)
             # llm loss has been global averaged
             llm_loss = output["loss"]
             step_llm_loss += llm_loss.detach().clone()
