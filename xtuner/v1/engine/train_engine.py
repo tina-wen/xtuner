@@ -24,10 +24,6 @@ from torch.utils._foreach_utils import (
 from xtuner.v1.config import FSDPConfig, OptimConfig
 from xtuner.v1.data_proto.sequence_context import SequenceContext
 from xtuner.v1.loss import LogProbContext
-from xtuner.v1.engine.xtuner_cache_planner import XtunerCacheSavePlanner
-from xtuner.v1.engine.xtuner_storage import XtunerCacheWriter
-
-
 from xtuner.v1.model.base import (
     BaseModel,
     BatchForwardInfo,
