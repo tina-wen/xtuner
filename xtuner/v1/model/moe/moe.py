@@ -343,6 +343,7 @@ class MoE(BaseModel):
 
         # Prepare input embeddings for all micro-batches
         if seq_ctx_list[0].input_ids is None:
+            assert all(ctx.inputs_embeds is not None for ctx in seq_ctx_list)
             cat_hidden_states = torch.cat([ctx.inputs_embeds for ctx in seq_ctx_list], dim=1)  # type: ignore
         else:
             cat_input_ids = torch.cat([ctx.input_ids for ctx in seq_ctx_list], dim=1)  # type: ignore
@@ -356,9 +357,6 @@ class MoE(BaseModel):
             )
         )
         
-        mask_list = torch.cat([ctx.mask for ctx in seq_ctx_list], dim=1)  # (1, intra_layer_micro_batch * seq_len)
-        indices = torch.nonzero(mask_list, as_tuple=True)[1]
-
         # Initialize output containers
         output: dict = {}
 
@@ -369,15 +367,10 @@ class MoE(BaseModel):
         cat_seq_ctx: SequenceContext | None = None
 
         moe_forward = False
+        hidden_states_list: list[torch.Tensor] = []
 
         for seq_ctx in seq_ctx_list:
             self._mark_dynamic(seq_ctx)
-
-        num_layers = len(self.layers)
-        local_load = torch.zeros(num_layers, self.config.n_routed_experts).npu() # (nlayers, ne)
-        local_gating_sum = torch.zeros(num_layers, self.config.n_routed_experts).npu()
-        local_load_logits = torch.zeros(num_layers, self.config.n_routed_experts, 
-                                        dtype = torch.int64).npu()
 
         for idx, decoder_layer in self.layers.items():
             layer_idx = int(idx)
@@ -403,13 +396,13 @@ class MoE(BaseModel):
                     moe_forward = True
 
                 if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1:
+                    hidden_states_ptrs = tuple(hidden_state.data_ptr() for hidden_state in hidden_states_list)
                     with async_save_on_cpu(
                         h2d_stream=self.offload_stream,
                         d2h_stream=self.offload_stream,
                         block_idx=layer_idx - self.config.first_k_dense_replace,
                         depth=len(self.layers) - self.config.first_k_dense_replace,
-                        custom_check_fn=lambda x: x.data_ptr()
-                        in [hidden_states.data_ptr() for hidden_states in hidden_states_list],
+                        custom_check_fn=lambda x: x.data_ptr() in hidden_states_ptrs,
                         prefetch=True,
                     ):
                         layer_results = decoder_layer(
@@ -424,50 +417,21 @@ class MoE(BaseModel):
                         seq_ctx=seq_ctx_list,
                     )
                     
-                # 保存当前层的结果（深拷贝，避免后续被覆盖）
-                hidden_states_list = layer_results[:len(hidden_states_list)]
-                # 原_select_non_pad_router_logits实现
-                
-                # 原balance_loss实现
-                if self.balancing_loss:
-                    router_weights_list = torch.cat(layer_results[len(hidden_states_list)*2:], dim=0).unsqueeze(0)
-                    router_weights = (
-                        torch.index_select(router_weights_list, 1, indices).contiguous().float()
-                    ) 
-                    _, selected_experts = torch.topk(router_weights, self.config.num_experts_per_tok, dim=-1)
-                    tokens_per_expert = torch.histc(
-                        selected_experts.view(-1),
-                        bins=self.config.n_routed_experts,
-                        min=0,
-                        max=self.config.n_routed_experts,
-                    ).float()
-                    local_load[layer_idx] = tokens_per_expert
-                    local_gating_sum[layer_idx] = router_weights.sum(dim = 1)
-        
-                router_logits_list = torch.cat(layer_results[len(hidden_states_list):len(hidden_states_list)*2], dim=0).unsqueeze(0)
-                router_logits = (
-                        torch.index_select(router_logits_list, 1, indices).contiguous().float()
-                    ) 
-                _, selected_experts = torch.topk(router_logits, self.config.num_experts_per_tok, dim=-1)
-                tokens_per_expert = torch.histc(
-                    selected_experts.view(-1),
-                    bins=self.config.n_routed_experts,
-                    min=0,
-                    max=self.config.n_routed_experts,
-                ).to(torch.long) # (ne,)
-                local_load_logits[layer_idx] = tokens_per_expert
-                
-                
-                
-                # if self.z_loss:
-                #     router_logits = (
-                #         torch.index_select(router_logits_list, 1, indices).contiguous().float()
-                #     ) 
-                #     z_loss = self.z_loss(router_logits=router_logits)
-                #     output["z_loss"] = output.get("z_loss", 0) + z_loss
+                hidden_states = layer_results[: len(hidden_states_list)]
+                router_logits = layer_results[len(hidden_states_list) : len(hidden_states_list) * 2]
+                router_weights = layer_results[len(hidden_states_list) * 2 :]
+
+                # Update hidden states and collect router results
+                for i, hidden_states_item in enumerate(hidden_states):
+                    hidden_states_list[i] = hidden_states_item
+                    router_logits_list[i][f"layer{idx}"] = router_logits[i]
+                    router_weights_list[i][f"layer{idx}"] = router_weights[i]
         # Apply final norm to all micro-batches
-        cat_hidden_states = torch.cat(hidden_states_list, dim=1)
-        cat_hidden_states = self.norm(cat_hidden_states)
+        if not moe_forward:
+            cat_hidden_states = self.norm(cat_hidden_states)
+        else:
+            cat_hidden_states = torch.cat(hidden_states_list, dim=1)
+            cat_hidden_states = self.norm(cat_hidden_states)
 
         # Process final outputs for each micro-batch
         cat_loss_ctx = CELossContext.cat(loss_ctx_list)
@@ -480,31 +444,50 @@ class MoE(BaseModel):
             moe_extra_info.append(extra_info)
         output["extra_info"] = moe_extra_info
 
-        # all_reduce（由local到global），计算求和
-        if self.balancing_loss:
-            if self.balancing_loss.global_average and dist.is_initialized(): 
-                # 计算专家负载：每个专家处理的token个数
-                tokens_per_expert_global = all_reduce(local_load, "sum", dist.group.WORLD)
-                tokens_global = tokens_per_expert_global.sum(-1)  # (nlayers, )
-                seqlen_global = tokens_global // self.config.num_experts_per_tok 
-                # 计算门控分数
-                routing_weights_sum_global = all_reduce_autograd(
-                    local_gating_sum, "sum", dist.group.WORLD
-                )
-                routing_weights_mean_global = routing_weights_sum_global / seqlen_global.unsqueeze(-1)
-                scale_global = self.config.n_routed_experts / tokens_global
-            else:
-                pass
-            loss = scale_global * (tokens_per_expert_global * routing_weights_mean_global).sum(-1) 
-            loss = loss.sum()
-            output["balancing_loss"] = loss * self.balancing_loss.loss_weight
+        # Handle router results for all micro-batches
+        all_router_logits = []
+        all_router_weights = []
 
-        # Calculate tokens per expert for bias update (if applicable)
-        if dist.is_initialized():
-            tokens_per_expert_global = all_reduce(local_load_logits, "sum", dist.group.WORLD)
+        for micro_batch_idx, (micro_batch_router_logits, micro_batch_router_weights) in enumerate(
+            zip(router_logits_list, router_weights_list)
+        ):
+            if micro_batch_router_logits:
+                _router_logits_list = list(micro_batch_router_logits.values())
+                _router_weights_list = list(micro_batch_router_weights.values())
+
+                attn_mask = seq_ctx_list[micro_batch_idx].mask
+                router_logits = self._select_non_pad_router_logits(_router_logits_list, attn_mask)
+                router_weights = self._select_non_pad_router_logits(_router_weights_list, attn_mask)
+                all_router_logits.append(router_logits)
+                all_router_weights.append(router_weights)
+
+        if all_router_logits:
+            combined_router_logits = torch.cat(all_router_logits, dim=1)
+            combined_router_weights = torch.cat(all_router_weights, dim=1)
+
+            if self.balancing_loss:
+                balancing_loss = self.balancing_loss(
+                    router_weights=combined_router_weights,
+                    n_routed_experts=self.config.n_routed_experts,
+                    num_experts_per_tok=self.config.num_experts_per_tok,
+                )
+                output["balancing_loss"] = balancing_loss
+
+            if self.z_loss:
+                z_loss = self.z_loss(router_logits=combined_router_logits)
+                output["z_loss"] = z_loss
+
+            tokens_per_expert_global = self._cal_tokens_per_expert(combined_router_logits)
+            output["tokens_per_expert_global"] = tokens_per_expert_global
+            del combined_router_logits
+            del combined_router_weights
         else:
-            tokens_per_expert_global = local_load_logits
-        output["tokens_per_expert_global"] = tokens_per_expert_global #.to(torch.long)
+            output["tokens_per_expert_global"] = torch.zeros(
+                self.config.num_hidden_layers - self.config.first_k_dense_replace,
+                self.config.n_routed_experts,
+                dtype=torch.int64,
+                device=DEVICE,
+            )
         if self.config.return_router_results or return_router_logits:
             # raise NotImplementedError
 
@@ -521,6 +504,8 @@ class MoE(BaseModel):
                 router_logits_dict[layer_name] = router_logits
 
             output["router_logits"] = router_logits_dict
+        else:
+            output["router_logits"] = None
 
         return MoEModelOutputs(**output, logits=logits)  # type: ignore[typeddict-item]
 
@@ -537,6 +522,7 @@ class MoE(BaseModel):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = seq_ctx.inputs_embeds
+        assert hidden_states is not None
 
         # create position embeddings to be shared across the decoder layers
         assert position_ids is not None
@@ -559,13 +545,15 @@ class MoE(BaseModel):
                     seq_ctx=seq_ctx,
                 )
             else:
+                assert hidden_states is not None
                 if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1:
+                    hidden_states_ptr = hidden_states.data_ptr()
                     with async_save_on_cpu(
                         h2d_stream=self.offload_stream,
                         d2h_stream=self.offload_stream,
                         block_idx=int(idx),
                         depth=len(self.layers),
-                        custom_check_fn=lambda x: x.data_ptr() == hidden_states.data_ptr(),
+                        custom_check_fn=lambda x: x.data_ptr() == hidden_states_ptr,
                     ):
                         layer_results = decoder_layer(
                             hidden_states,
