@@ -1915,7 +1915,10 @@ class Trainer:
 
     def _load_checkpoint(self):
         load_checkpoint_cfg: LoadCheckpointConfig = self._load_checkpoint_cfg
-
+        # 从本地文件获取cpu_binder文件类
+        import cpu_binder
+        # 执行cpu_binder 细粒度绑核操作
+        cpu_binder.run(self.rank)
         if (resume_from := load_checkpoint_cfg.checkpoint_path) is None:
             logger.info("No checkpoint to resume from.")
             return
