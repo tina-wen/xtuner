@@ -29,7 +29,6 @@ class CausalConv1dFunction(torch.autograd.Function):
         ctx.save_for_backward(x, weight, bias, residual, initial_state)
         ctx.activation = activation
         ctx.cu_seqlens = cu_seqlens
-        ctx.H = H
         
         # Call the forward implementation
         y, final_state = causal_conv1d_fwd_impl(
