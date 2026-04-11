@@ -73,7 +73,7 @@ def flash_chunk_gated_delta_rule_fwd(
 ):
 
     g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens, head_first=False)
-
+    k = k.transpose(1, 2).contiguous()
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
         k=k,
@@ -83,6 +83,7 @@ def flash_chunk_gated_delta_rule_fwd(
         chunk_size=chunk_size,
         output_dtype=torch.float32
     )
+    k = k.transpose(1, 2).contiguous()
     A = solve_tril(
         A=A,
         cu_seqlens=cu_seqlens,
@@ -104,16 +105,12 @@ def flash_chunk_gated_delta_rule_fwd(
 
     q = q.transpose(1, 2).contiguous()
     k = k.transpose(1, 2).contiguous()
-    w = w.transpose(1, 2).contiguous()
-    u = u.transpose(1, 2).contiguous()
+    # w = w.transpose(1, 2).contiguous()
+    # u = u.transpose(1, 2).contiguous()
     g = g.transpose(1, 2).contiguous()
 
     import torch.distributed as dist
 
-    # if not dist.is_initialized() or dist.get_rank() == 0:
-    #     breakpoint()  # 或使用 pdb.set_trace()
-    # print(cu_seqlens.dtype)
-    # print(chunk_indices.dtype)
     h, v_new, final_state = torch_npu.npu_chunk_gated_delta_rule_fwd_h(
         k,
         w,
@@ -173,14 +170,14 @@ def flash_chunk_gated_delta_rule_bwd(
     else:
         chunk_indices = None
 
-    w = w.transpose(1, 2).contiguous()
+    # w = w.transpose(1, 2).contiguous()
     v = v.transpose(1, 2).contiguous()
     q = q.transpose(1, 2).contiguous()
     k = k.transpose(1, 2).contiguous()
     do = do.transpose(1, 2).contiguous()
     g = g.transpose(1, 2).contiguous()
     beta = beta.transpose(1, 2).contiguous().float()
-    u = u.transpose(1, 2).contiguous()
+    # u = u.transpose(1, 2).contiguous()
     A = A.transpose(1, 2).contiguous()
     
     h, v_new, _ = torch_npu.npu_chunk_gated_delta_rule_fwd_h(
@@ -214,9 +211,6 @@ def flash_chunk_gated_delta_rule_bwd(
       chunk_size=chunk_size
     )
     
-    # 对齐？
-    # if not dist.is_initialized() or dist.get_rank() == 0:
-    # breakpoint()  # 或使用 pdb.set_trace()
     dh, dh0, dv = torch_npu.npu_chunk_gated_delta_rule_bwd_dhu(
         q,
         k,

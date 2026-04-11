@@ -208,7 +208,7 @@ def recompute_w_u_fwd_kernel(
 
                 for i_v in range(tl.cdiv(V, BV)):
                     p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-                    p_u = tl.make_block_ptr(u + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+                    p_u = tl.make_block_ptr(u + (i_h * T_max + bos) * V, (T, V), (V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
                     b_v = tl.load(p_v, boundary_check=(0, 1))
                     b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
                     b_u = tl.dot(b_A, b_vb, allow_tf32=False)
@@ -220,7 +220,7 @@ def recompute_w_u_fwd_kernel(
 
                 for i_k in range(tl.cdiv(K, BK)):
                     p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-                    p_w = tl.make_block_ptr(w + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+                    p_w = tl.make_block_ptr(w + (i_h * T_max + bos) * K, (T, K), (K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
                     b_k = tl.load(p_k, boundary_check=(0, 1))
                     b_kb = b_k * b_beta[:, None]
                     if USE_G:
@@ -251,8 +251,8 @@ def recompute_w_u_fwd(
     g = g.transpose(1, 2).contiguous() if g is not None else None
     beta = beta.transpose(1, 2).contiguous()
 
-    w = torch.empty_like(k)
-    u = torch.empty_like(v)
+    w = torch.empty(B, H, T, K, dtype=k.dtype, device=k.device)
+    u = torch.empty(B, H, T, V, dtype=v.dtype, device=v.device)
     cv_kernel_num = 24
     recompute_w_u_fwd_kernel[(cv_kernel_num,)](
         k=k,
@@ -276,7 +276,6 @@ def recompute_w_u_fwd(
         BV=BV,
     )
     return w, u
-
 
 def prepare_wy_repr_bwd(
     k: torch.Tensor,
