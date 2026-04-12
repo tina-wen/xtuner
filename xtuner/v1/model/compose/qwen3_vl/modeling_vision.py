@@ -103,8 +103,12 @@ def apply_rotary_pos_emb_vision(
     orig_k_dtype = k.dtype
     q, k = q.float(), k.float()
     cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    # q_embed = (q * cos) + (rotate_half(q) * sin)
+    # k_embed = (k * cos) + (rotate_half(k) * sin)
+    import torch_npu
+    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
+    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
+
     q_embed = q_embed.to(orig_q_dtype)
     k_embed = k_embed.to(orig_k_dtype)
     return q_embed, k_embed
