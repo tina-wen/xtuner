@@ -18,7 +18,7 @@ import torch_npu
 
 from .triton_core.l2norm import l2norm_bwd, l2norm_fwd
 from .triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-from .triton_core.wy_fast import recompute_w_u_fwd
+from .triton_core.wy_fast import recompute_w_u_fwd, recompute_w_u_fwd_new
 from .triton_core.solve_tril import solve_tril
 from .triton_core.cumsum import chunk_local_cumsum
 from .triton_core.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
@@ -73,7 +73,6 @@ def flash_chunk_gated_delta_rule_fwd(
 ):
 
     g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens, head_first=False)
-    k = k.transpose(1, 2).contiguous()
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
         k=k,
@@ -83,13 +82,17 @@ def flash_chunk_gated_delta_rule_fwd(
         chunk_size=chunk_size,
         output_dtype=torch.float32
     )
-    k = k.transpose(1, 2).contiguous()
+   
     A = solve_tril(
         A=A,
         cu_seqlens=cu_seqlens,
         output_dtype=k.dtype
     )
-    w, u = recompute_w_u_fwd(
+    
+    g = g.transpose(1, 2).contiguous()
+    beta = beta.transpose(1, 2).contiguous().float()
+    A = A.transpose(1, 2).contiguous()
+    w, u = recompute_w_u_fwd_new(
         k=k,
         v=v,
         beta=beta,
@@ -103,11 +106,6 @@ def flash_chunk_gated_delta_rule_fwd(
     else:
         chunk_indices = None
 
-    q = q.transpose(1, 2).contiguous()
-    k = k.transpose(1, 2).contiguous()
-    # w = w.transpose(1, 2).contiguous()
-    # u = u.transpose(1, 2).contiguous()
-    g = g.transpose(1, 2).contiguous()
 
     import torch.distributed as dist
 
@@ -156,7 +154,9 @@ def flash_chunk_gated_delta_rule_bwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
 ):
-    w, u = recompute_w_u_fwd(
+    g = g.transpose(1, 2).contiguous()
+    beta = beta.transpose(1, 2).contiguous().float()
+    w, u = recompute_w_u_fwd_new(
         k=k,
         v=v,
         beta=beta,
@@ -170,15 +170,7 @@ def flash_chunk_gated_delta_rule_bwd(
     else:
         chunk_indices = None
 
-    # w = w.transpose(1, 2).contiguous()
-    v = v.transpose(1, 2).contiguous()
-    q = q.transpose(1, 2).contiguous()
-    k = k.transpose(1, 2).contiguous()
     do = do.transpose(1, 2).contiguous()
-    g = g.transpose(1, 2).contiguous()
-    beta = beta.transpose(1, 2).contiguous().float()
-    # u = u.transpose(1, 2).contiguous()
-    A = A.transpose(1, 2).contiguous()
     
     h, v_new, _ = torch_npu.npu_chunk_gated_delta_rule_fwd_h(
         k,
@@ -246,11 +238,11 @@ def flash_chunk_gated_delta_rule_bwd(
     dA = torch_npu.npu_prepare_wy_repr_bwd_da(
         k, 
         v, 
-        beta, 
+        beta.float(), 
         A, 
         dw, 
         dv, 
-        g, 
+        g.float(), 
         cu_seqlens=cu_seqlens1,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size
@@ -270,12 +262,8 @@ def flash_chunk_gated_delta_rule_bwd(
         chunk_size=chunk_size
     )
     
-    dv = dv.transpose(1, 2).contiguous()
-    dk2 = dk2.transpose(1, 2).contiguous()
     db = db.transpose(1, 2).contiguous()
     dg2 = dg2.transpose(1, 2).contiguous()
-    dq = dq.transpose(1, 2).contiguous()
-    dk = dk.transpose(1, 2).contiguous()
     dg = dg.transpose(1, 2).contiguous()
 
     dk.add_(dk2)
