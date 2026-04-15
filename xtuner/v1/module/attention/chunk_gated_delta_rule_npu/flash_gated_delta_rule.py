@@ -92,22 +92,28 @@ def flash_chunk_gated_delta_rule_fwd(
     g = g.transpose(1, 2).contiguous()
     beta = beta.transpose(1, 2).contiguous().float()
     A = A.transpose(1, 2).contiguous()
-    w, u = recompute_w_u_fwd_new(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g=g,
-        cu_seqlens=cu_seqlens,
+    if cu_seqlens is not None:
+        cu_seqlens1 = cu_seqlens.tolist()
+        chunk_indices = prepare_chunk_indices1(cu_seqlens1, chunk_size)
+    else:
+        cu_seqlens1 = None
+
+    w, u = torch_npu.npu_recompute_w_u_fwd(
+        k,
+        v,
+        beta,
+        A,
+        g,
+        None,
+        cu_seqlens=cu_seqlens1,
+        chunk_indices=chunk_indices,
+        chunk_size=chunk_size
     )
 
     if cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     else:
         chunk_indices = None
-
-
-    import torch.distributed as dist
 
     h, v_new, final_state = torch_npu.npu_chunk_gated_delta_rule_fwd_h(
         k,
@@ -156,13 +162,23 @@ def flash_chunk_gated_delta_rule_bwd(
 ):
     g = g.transpose(1, 2).contiguous()
     beta = beta.transpose(1, 2).contiguous().float()
-    w, u = recompute_w_u_fwd_new(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g=g,
-        cu_seqlens=cu_seqlens,
+    
+    if cu_seqlens is not None:
+        cu_seqlens1 = cu_seqlens.tolist()
+        chunk_indices = prepare_chunk_indices1(cu_seqlens1, chunk_size)
+    else:
+        cu_seqlens1 = None
+
+    w, u = torch_npu.npu_recompute_w_u_fwd(
+        k,
+        v,
+        beta,
+        A,
+        g,
+        None,
+        cu_seqlens=cu_seqlens1,
+        chunk_indices=chunk_indices,
+        chunk_size=chunk_size
     )
     
     if cu_seqlens is not None:
