@@ -93,6 +93,41 @@ MOE_NON_EP_COMPILE_CFG: dict[str, TorchCompileOption] = {
 MOE_EP_COMPILE_CFG = MOE_NON_EP_COMPILE_CFG.copy()
 MOE_EP_COMPILE_CFG.pop("xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEDecoderLayer.forward")
 
+def cdiv_torch(a, b):
+    return (a + b - 1) // b
+
+def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
+    return cu_seqlens[1:] - cu_seqlens[:-1]
+
+def prepare_chunk_indices(
+    cu_seqlens: torch.LongTensor,
+    chunk_size: int
+) -> torch.LongTensor:
+    indices = torch.cat([torch.arange(n) for n in cdiv_torch(prepare_lens(cu_seqlens), chunk_size).tolist()])
+    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
+
+
+def prepare_chunk_indices1( 
+    cu_seqlens: list[int],
+    chunk_size: int
+ ) -> list[int]: 
+    indices = []
+    
+    for i in range(len(cu_seqlens) - 1):
+        start = cu_seqlens[i]
+        end = cu_seqlens[i+1]
+        length = end - start
+        
+        if length <= 0:
+            continue
+            
+        num_chunks = (length + chunk_size - 1) // chunk_size
+        
+        for chunk_id in range(num_chunks):
+            indices.append((i))
+            indices.append((chunk_id))
+            
+    return indices
 
 class MoEModelOutputs(ModelOutputs):
     router_logits: dict[str, torch.Tensor] | None = None
@@ -611,6 +646,11 @@ class MoE(BaseModel):
     ) -> MoEModelOutputs:
         input_ids = seq_ctx.input_ids
         position_ids = seq_ctx.position_ids
+        
+        cu_seq_lens_int64 = seq_ctx.cu_seq_lens_q.to(torch.int64).npu()
+        seq_ctx.cu_seq_lens_list = cu_seq_lens_int64.tolist()  # for compatibility with prepare_chunk_indices1
+        seq_ctx.chunk_indices = prepare_chunk_indices(cu_seq_lens_int64, chunk_size = 64)
+        seq_ctx.chunk_indices1 = prepare_chunk_indices1(cu_seq_lens_int64, chunk_size = 64)
 
         if input_ids is not None:
             hidden_states = self.embed_tokens(input_ids)

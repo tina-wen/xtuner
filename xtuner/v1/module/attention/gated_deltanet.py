@@ -651,7 +651,10 @@ class GatedDeltaNet(nn.Module):
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
-            cu_seqlens=seq_ctx.cu_seq_lens_q
+            cu_seqlens=seq_ctx.cu_seq_lens_q,
+            cu_seqlens_list=seq_ctx.cu_seq_lens_list,
+            chunk_indices=seq_ctx.chunk_indices,
+            chunk_indices1=seq_ctx.chunk_indices1,
         )
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)

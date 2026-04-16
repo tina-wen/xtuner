@@ -6,8 +6,6 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import prepare_chunk_indices
-
 
 @triton.heuristics({
     'HAS_SCALE': lambda args: args['scale'] is not None,
@@ -80,6 +78,7 @@ def chunk_local_cumsum_scalar(
     reverse: bool = False,
     scale: float = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    chunk_indices: Optional[torch.Tensor] = None,
     head_first: bool = False,
     output_dtype: Optional[torch.dtype] = torch.float
 ) -> torch.Tensor:
@@ -90,7 +89,6 @@ def chunk_local_cumsum_scalar(
             f"chunk_size must be a power of 2, chunk_size is{chunk_size}"
         )
     BT = triton.next_power_of_2((1 << 17) // (H * chunk_size))
-    chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B)
@@ -117,6 +115,7 @@ def chunk_local_cumsum(
     reverse: bool = False,
     scale: float = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    chunk_indices: Optional[torch.Tensor] = None,
     head_first: bool = False,
     output_dtype: Optional[torch.dtype] = torch.float,
     **kwargs
@@ -133,6 +132,7 @@ def chunk_local_cumsum(
             reverse=reverse,
             scale=scale,
             cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
             head_first=head_first,
             output_dtype=output_dtype
         )
