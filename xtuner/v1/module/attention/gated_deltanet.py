@@ -418,27 +418,37 @@ class GatedDeltaNet(nn.Module):
 
         # TODO: due to the limitation of scatter_dim=1 in ulysses_all_to_all,
         # the implementation is very inelegant and inefficient, and needs to be refactored in the future.
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-        mixed_qkv = self.causal_conv1d_fn(
-            x=mixed_qkv,  # need non contiguous
-            weight=weight,
-            bias=bias,
-            activation=self.activation,
-            seq_idx=seq_idx,
-        )
-        mixed_qkv = mixed_qkv.transpose(1, 2)
+        if self.causal_conv1d_fn is not None:
+            mixed_qkv = mixed_qkv.transpose(1, 2)
+            mixed_qkv = self.causal_conv1d_fn(
+                x=mixed_qkv,  # need non contiguous
+                weight=weight,
+                bias=bias,
+                activation=self.activation,
+                seq_idx=seq_idx,
+            )
+            mixed_qkv = mixed_qkv.transpose(1, 2)
+        else:    
+            if seq_ctx.cu_seq_lens_q is not None and seq_ctx.cu_seq_lens_q.device != mixed_qkv.device:
+                seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(mixed_qkv.device)
+            mixed_qkv, _ = causal_conv1d_triton(
+                x=mixed_qkv,
+                weight=weight,
+                H=2*self.num_k_heads + self.num_v_heads,
+                bias=bias,
+                activation=self.activation,
+                cu_seqlens=seq_ctx.cu_seq_lens_q,
+            )
+
         query, key, value = torch.split(
             mixed_qkv,
             [
-                self.key_dim,
-                self.key_dim,
-                self.value_dim,
+                self.num_k_heads,
+                self.num_k_heads,
+                self.num_v_heads,
             ],
-            dim=-1,
+            dim=1,
         )
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
@@ -452,9 +462,8 @@ class GatedDeltaNet(nn.Module):
         g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
 
         if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
+            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
+            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
         core_attn_out, _ = self.chunk_gated_delta_rule(
             query,
             key,
