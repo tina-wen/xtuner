@@ -277,27 +277,38 @@ class GatedDeltaNet(nn.Module):
         query = query.transpose(1, 2).contiguous().transpose(1, 2)  # make it contiguous for causal_conv1d_fn
         key = key.transpose(1, 2).contiguous().transpose(1, 2)  # make it contiguous for causal_conv1d_fn
         value = value.transpose(1, 2).contiguous().transpose(1, 2)  # make it contiguous for causal_conv1d_fn
-        query = self.causal_conv1d_fn(  # query (batch, dim, seqlen)
-            x=query,  # need non contiguous
-            weight=query_weight,
-            bias=bias,
-            activation=self.activation,
-            seq_idx=seq_idx,
-        )
-        key = self.causal_conv1d_fn(
-            x=key,  # need non contiguous
-            weight=key_weight,
-            bias=bias,
-            activation=self.activation,
-            seq_idx=seq_idx,
-        )
-        value = self.causal_conv1d_fn(
-            x=value,  # need non contiguous
-            weight=value_weight,
-            bias=bias,
-            activation=self.activation,
-            seq_idx=seq_idx,
-        )
+
+        if True:
+            if seq_ctx.cu_seq_lens_q is not None and seq_ctx.cu_seq_lens_q.device != query.device:
+                # origin_device = seq_ctx.cu_seq_lens_q.device
+                seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(query.device)
+            query = query.transpose(1, 2)  # (1, dim, L/sp_size)
+            key = key.transpose(1, 2)
+            value = value.transpose(1, 2)
+            query, _ = causal_conv1d_triton(
+                x=query,
+                weight=query_weight,
+                H=int(self.num_k_heads/sp_size),
+                bias=bias,
+                activation=self.activation,
+                cu_seqlens=seq_ctx.cu_seq_lens_q,
+            )
+            key, _ = causal_conv1d_triton(
+                x=key,
+                weight=key_weight,
+                H=int(self.num_k_heads/sp_size),
+                bias=bias,
+                activation=self.activation,
+                cu_seqlens=seq_ctx.cu_seq_lens_q,
+            )
+            value, _ = causal_conv1d_triton(
+                x=value,
+                weight=value_weight,
+                H=int(self.num_v_heads/sp_size),
+                bias=bias,
+                activation=self.activation,
+                cu_seqlens=seq_ctx.cu_seq_lens_q,
+            )
 
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
@@ -311,19 +322,19 @@ class GatedDeltaNet(nn.Module):
         g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
 
         # (1,key_dim/sp_size, L)
-        query = query.transpose(1, 2).reshape(
-            batch_size, seq_len * sp_size, -1, self.head_k_dim
-        )  # (1, L, num_k_heads/sp_size, head_k_dim)
-        key = key.transpose(1, 2).reshape(
-            batch_size, seq_len * sp_size, -1, self.head_k_dim
-        )  # (1, L, num_k_heads/sp_size, head_k_dim)
-        value = value.transpose(1, 2).reshape(
-            batch_size, seq_len * sp_size, -1, self.head_v_dim
-        )  # (1, L, num_v_heads/sp_size, head_v_dim)
+        # query = query.transpose(1, 2).reshape(
+        #     batch_size, seq_len * sp_size, -1, self.head_k_dim
+        # )  # (1, L, num_k_heads/sp_size, head_k_dim)
+        # key = key.transpose(1, 2).reshape(
+        #     batch_size, seq_len * sp_size, -1, self.head_k_dim
+        # )  # (1, L, num_k_heads/sp_size, head_k_dim)
+        # value = value.transpose(1, 2).reshape(
+        #     batch_size, seq_len * sp_size, -1, self.head_v_dim
+        # )  # (1, L, num_v_heads/sp_size, head_v_dim)
 
         if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
+            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
 
         if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
             g = g.transpose(1, 2)
@@ -354,6 +365,9 @@ class GatedDeltaNet(nn.Module):
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=seq_ctx.cu_seq_lens_q,
+            cu_seqlens_list=seq_ctx.cu_seq_lens_list,
+            chunk_indices=seq_ctx.chunk_indices,
+            chunk_indices_list=seq_ctx.chunk_indices_list 
         )
 
         if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
