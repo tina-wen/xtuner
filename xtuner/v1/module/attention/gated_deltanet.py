@@ -461,6 +461,7 @@ class GatedDeltaNet(nn.Module):
                 bias=bias,
                 activation=self.activation,
                 cu_seqlens=seq_ctx.cu_seq_lens_q,
+                chunk_indices=seq_ctx.chunk_indices,
             )
             key, _ = causal_conv1d_triton(
                 x=key,
@@ -469,6 +470,7 @@ class GatedDeltaNet(nn.Module):
                 bias=bias,
                 activation=self.activation,
                 cu_seqlens=seq_ctx.cu_seq_lens_q,
+                chunk_indices=seq_ctx.chunk_indices,
             )
             value, _ = causal_conv1d_triton(
                 x=value,
@@ -477,6 +479,7 @@ class GatedDeltaNet(nn.Module):
                 bias=bias,
                 activation=self.activation,
                 cu_seqlens=seq_ctx.cu_seq_lens_q,
+                chunk_indices=seq_ctx.chunk_indices,
             )
 
         beta = b.sigmoid()
