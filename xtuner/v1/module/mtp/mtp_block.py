@@ -4,12 +4,14 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
+import os
 
 from xtuner.v1.data_proto import SequenceContext
 
 from .config import MTPConfig
 from .mtp_layer import MTPLayer
 from .utils import roll_sequence_context
+from xtuner.v1.utils.activation_offload import async_save_on_cpu
 
 
 class MTPBlock(nn.Module):
@@ -109,7 +111,11 @@ class MTPBlock(nn.Module):
             layer = self.layers[0] if self.mtp_config.share_weights else self.layers[step]
             # Roll sequence context to get future tokens
             # This shifts each packed sequence independently, respecting boundaries
-            current_seq_ctx = roll_sequence_context(current_seq_ctx, shifts=-1)
+            next_seq_ctx = roll_sequence_context(current_seq_ctx, shifts=-1)
+            current_seq_ctx._raw_inputs_embeds = None 
+            current_seq_ctx = next_seq_ctx
+            if hasattr(seq_ctx, "cu_seq_lens_list"):
+                current_seq_ctx.cu_seq_lens_list = seq_ctx.cu_seq_lens_list
 
             # Get embeddings for future tokens
             if current_seq_ctx.inputs_embeds is None:
@@ -138,4 +144,5 @@ class MTPBlock(nn.Module):
         if shared_layer is not None:
             shared_layer.reshard()
 
+        next_seq_ctx._raw_inputs_embeds = None
         return mtp_outputs
