@@ -168,7 +168,7 @@ class LMHeadLossContext(BaseLossContext):
                 raise AssertionError(
                     "loss_weight contains NaN or Inf values. Please filter out samples with no valid tokens."
                 )
-            loss_ctx.loss_kwargs.loss_weight = loss_weight
+            loss_ctx.loss_kwargs.loss_weight = loss_weight.to(DEVICE)
             loss_weight_list.append(loss_weight)
 
         # Compute the denominator used in the global calibration of the loss
@@ -183,6 +183,40 @@ class LMHeadLossContext(BaseLossContext):
             assert loss_ctx.loss_kwargs.loss_weight is not None
             loss_ctx.loss_kwargs.loss_weight /= global_denominator + 1e-12
         return loss_ctx_list
+
+    def loss_fu_triton_npu(
+        self,
+        hidden_states: torch.Tensor,
+        head_weight: torch.Tensor,
+        head_bias: torch.Tensor | None,
+        loss_kwargs: CELossKwargs,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, dict[str, Any]]]:
+        # We do linear forward here to simplify the implementation of chunk loss (saving memory).
+        logits = F.linear(hidden_states, head_weight, head_bias)
+        # logits = logits.float()  # (bs, seq_len, vocab_size)
+
+        shifted_labels = loss_kwargs.shifted_labels  # (bs, seq_len)
+        loss_weight = loss_kwargs.loss_weight  # (bs, seq_len)
+        assert loss_weight is not None, "loss_weight can not be None"
+
+        logits = logits.reshape(-1, logits.size(-1))  # (bs * seq_len, vocab_size)
+        shifted_labels = shifted_labels.flatten()
+        loss_weight = loss_weight.flatten()
+
+        rank_grad_tokens = (shifted_labels != self.loss_cfg.ignore_idx).sum()
+        if rank_grad_tokens == 0:
+            loss = logits.sum() * 0
+        else:
+            from .loss_fn_triton import fused_cross_entropy_loss
+            # torch.save({"logits":logits.detach().cpu(), "loss_weight":loss_weight.detach().cpu(), "shifted_labels":shifted_labels.detach().cpu()}, "triton_loss_input.pt")
+            # exit()
+            loss = fused_cross_entropy_loss(logits, loss_weight, shifted_labels.to(torch.int32), ignore_index=self.loss_cfg.ignore_idx)
+
+            # loss = F.cross_entropy(logits, shifted_labels, reduction="none", ignore_index=self.loss_cfg.ignore_idx)
+            # # Step 2.b in the loss calculation: sum the loss over all tokens
+            # loss = (loss * loss_weight).sum()
+
+        return loss, (logits, {})
 
     def loss_fn(
         self,
@@ -292,3 +326,5 @@ class LMHeadLossContext(BaseLossContext):
 
 # Deprecated: Use LMHeadLossContext instead. Will be removed in version 1.1.0
 CELossContext = LMHeadLossContext
+if DEVICE == "npu":
+    LMHeadLossContext.loss_fn = LMHeadLossContext.loss_fu_triton_npu
